@@ -286,4 +286,8 @@
     <string name="admin_sealed_toast">The Door: Sealed</string>
     <string name="admin_disable_warning">Desativar o The Door Seal enfraquecerá a proteção no nível do sistema.</string>
     <string name="admin_unsealed_toast">The Door: Unsealed</string>
+
+    <!-- Protection overlay -->
+    <string name="protection_overlay_title">Pausado pelo The Door</string>
+    <string name="protection_overlay_subtitle">Esta tela é protegida. Respire fundo.</string>
 </resources>

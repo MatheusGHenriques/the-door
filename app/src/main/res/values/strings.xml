@@ -374,4 +374,8 @@
 
     <string name="admin_unsealed_toast">The Door: Unsealed</string>
 
+    <!-- Protection overlay -->
+    <string name="protection_overlay_title">Paused by The Door</string>
+    <string name="protection_overlay_subtitle">This screen is protected. Take a deep breath.</string>
+
 </resources>

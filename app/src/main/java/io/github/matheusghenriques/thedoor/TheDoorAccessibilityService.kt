@@ -1,7 +1,9 @@
 package io.github.matheusghenriques.thedoor
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.admin.DevicePolicyManager
@@ -10,11 +12,17 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -25,10 +33,13 @@ import io.github.matheusghenriques.thedoor.data.CurrentUsageProvider
 import io.github.matheusghenriques.thedoor.data.OpenCountProvider
 import io.github.matheusghenriques.thedoor.data.PackageConstants
 import io.github.matheusghenriques.thedoor.data.ProtectionConfig
+import io.github.matheusghenriques.thedoor.data.ProtectionOverlayManager
+import io.github.matheusghenriques.thedoor.data.ProtectionShield
 import io.github.matheusghenriques.thedoor.data.RedirectConfig
 import io.github.matheusghenriques.thedoor.data.RedirectType
 import io.github.matheusghenriques.thedoor.data.TimeSchedule
 import io.github.matheusghenriques.thedoor.data.UsageTracker
+import io.github.matheusghenriques.thedoor.data.WindowSnapshot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -63,6 +74,11 @@ class TheDoorAccessibilityService : AccessibilityService() {
             listOf("install unknown apps", "instalar apps desconhecidos")
         private val BLOCKED_AUTO_BLOCKER =
             listOf("turn off auto blocker", "desativar o bloqueador automático")
+        private val CONTENT_BLOCKED_ACCESSIBILITY =
+            listOf("aplicativos instalados", "installed apps")
+        private const val WINDOW_SCAN_THROTTLE_MS = 150L
+        private const val OVERLAY_POLL_MS = 1_000L
+        private const val CONTENT_SCAN_MAX_NODES = 400
 
     }
 
@@ -76,6 +92,8 @@ class TheDoorAccessibilityService : AccessibilityService() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var tracker: UsageTracker
     private lateinit var repo: AppLimitRepository
+    private lateinit var shield: ProtectionShield
+    private lateinit var overlayManager: ProtectionOverlayManager
 
     private var lastActiveApp: String? = null
     private var trackedNotificationDate: String = ""
@@ -93,11 +111,29 @@ class TheDoorAccessibilityService : AccessibilityService() {
     private var trackedOpensDate: String = ""
 
     private var lastTimeChangeCheck: Long = 0L
+    private var lastWindowScanAt: Long = 0L
+    private var redirectPending = false
 
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                tracker.onScreenOff()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    tracker.onScreenOff()
+                    // Hide the containment overlay so the keyguard stays usable; the
+                    // incident state survives and is re-asserted after unlock.
+                    overlayManager.hide()
+                    stopOverlayPoll()
+                    shield.onScreenOff()
+                }
+
+                Intent.ACTION_USER_PRESENT -> {
+                    if (setupComplete) {
+                        // Re-assert containment as soon as the keyguard lifts.
+                        // Re-assertions must not record escalation: they restore a
+                        // known incident, they are not new attack detections.
+                        handler.post { assertProtectionOverlay(force = true, recordEscalation = false) }
+                    }
+                }
             }
         }
     }
@@ -111,6 +147,8 @@ class TheDoorAccessibilityService : AccessibilityService() {
         trackedNotificationDate = currentDateString()
         repo = AppLimitRepository(this)
         tracker = UsageTracker(this)
+        shield = ProtectionShield({ SystemClock.uptimeMillis() }, packageName)
+        overlayManager = ProtectionOverlayManager(this)
 
         scope.launch { watchConfigChanges() }
         scope.launch { watchRedirectConfig() }
@@ -128,11 +166,31 @@ class TheDoorAccessibilityService : AccessibilityService() {
         handler.postDelayed(gradualReductionCheck, 6 * 60 * 60 * 1000L)
         handler.postDelayed(limitCheckRunnable, 5_000L)
 
-        val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
+        val filter = IntentFilter(Intent.ACTION_SCREEN_OFF).apply {
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(screenOffReceiver, filter, RECEIVER_EXPORTED)
         } else {
             registerReceiver(screenOffReceiver, filter)
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        // Belt-and-suspenders: the XML config already declares these flags; re-apply
+        // at runtime (AppLock pattern) in case the declarative load is degraded.
+        try {
+            val info = serviceInfo
+            info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                    AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+            serviceInfo = info
+        } catch (e: Exception) {
+            Log.d("DoorBug", "onServiceConnected flags failed: ${e::class.java.simpleName}")
+        }
+        // Covers the rebind-after-crash case with a protected window already open.
+        if (setupComplete) {
+            handler.post { assertProtectionOverlay(force = true, recordEscalation = false) }
         }
     }
 
@@ -178,6 +236,8 @@ class TheDoorAccessibilityService : AccessibilityService() {
         super.onDestroy()
         handler.removeCallbacks(gradualReductionCheck)
         handler.removeCallbacks(limitCheckRunnable)
+        stopOverlayPoll()
+        overlayManager.hide()
         try {
             unregisterReceiver(screenOffReceiver)
         } catch (_: Exception) {
@@ -254,13 +314,22 @@ class TheDoorAccessibilityService : AccessibilityService() {
     private fun triggerBlock() {
         performGlobalAction(GLOBAL_ACTION_BACK)
 
+        // Collapse stacked redirects: under event spam each triggerBlock used to post
+        // its own delayed redirect, causing N startActivity calls. The pending
+        // runnable covers the state; skipping never suppresses the BACK above.
+        if (redirectPending) return
+        redirectPending = true
+
         handler.postDelayed({
+            redirectPending = false
             val config = cachedRedirectConfig
+            var navigated = false
 
             if (config.type != RedirectType.NONE) {
                 val targetPkg = when (config.type) {
                     RedirectType.APP -> config.appPackage
                     RedirectType.THE_DOOR -> packageName
+                    RedirectType.NONE -> ""
                 }
 
                 if (targetPkg.isNotBlank() && !userBlockedApps.containsKey(targetPkg) && !appLimitsMs.containsKey(
@@ -278,14 +347,246 @@ class TheDoorAccessibilityService : AccessibilityService() {
                         }
                         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
                         startActivity(intent)
+                        navigated = true
                     }
                 }
-            } else performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+
+            // Never leave the user parked on a blocked screen: if no redirect fired
+            // (type NONE or invalid/blocked target), fall back to HOME.
+            if (!navigated) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
 
             if (config.toastEnabled && config.toastMessage.isNotBlank()) {
                 Toast.makeText(applicationContext, config.toastMessage, Toast.LENGTH_SHORT).show()
             }
         }, 30L)
+    }
+
+    /**
+     * Protection-context block: everything triggerBlock does, PLUS the containment
+     * overlay and the dedicated escalation counter (separate from app-limit
+     * enforcement, never shared, never reset by lockNow).
+     *
+     * Escalation only counts triggers that arrive while the overlay is NOT yet
+     * shown — i.e., real exposure moments (transitions, post-unlock races).
+     * Repeated detections while already contained just extend the incident.
+     */
+    private fun triggerProtectionBlock(triggerPackage: String) {
+        val overlayWasShown = overlayManager.isShown
+        shield.startIncident(triggerPackage)
+        if (overlayWasShown) return
+        if (shield.recordEscalation()) {
+            Log.d("DoorBug", "ProtectionShield escalation -> lockScreenViaAdmin")
+            lockScreenViaAdmin()
+        }
+        // While the keyguard is up it already covers everything; showing the overlay
+        // there would block the owner out of the lock screen. USER_PRESENT re-asserts.
+        if (isKeyguardShowing()) return
+        overlayManager.show(cachedRedirectConfig.theDoorPhrase)
+        startOverlayPoll()
+        triggerBlock()
+    }
+
+    /**
+     * Evaluates the window set and applies the containment overlay decision.
+     * Throttled for event-driven calls; pass force=true for poll/re-assert paths.
+     *
+     * Removal is state-based, never event-package-based: the overlay only lifts
+     * after the shield confirms continuous absence of protected windows.
+     */
+    private fun assertProtectionOverlay(force: Boolean = false, recordEscalation: Boolean = true) {
+        // Never evaluate containment while the keyguard is up: the lock screen must
+        // stay usable, and absence/presence decisions made behind it are unreliable.
+        if (isKeyguardShowing()) return
+
+        val t = SystemClock.uptimeMillis()
+        if (!force && t - lastWindowScanAt < WINDOW_SCAN_THROTTLE_MS) return
+        lastWindowScanAt = t
+
+        val windowList: List<AccessibilityWindowInfo> = try {
+            windows.toList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        val contentTrigger = scanWindowsForProtectedContent(windowList)
+        if (contentTrigger != null) {
+            if (recordEscalation) {
+                triggerProtectionBlock(contentTrigger)
+            } else {
+                // Re-assertion of a known incident (USER_PRESENT / service rebind):
+                // containment and navigation, but no escalation and no lock.
+                val wasShown = overlayManager.isShown
+                shield.startIncident(contentTrigger)
+                if (!wasShown) {
+                    overlayManager.show(cachedRedirectConfig.theDoorPhrase)
+                    startOverlayPoll()
+                    triggerBlock()
+                }
+            }
+            return
+        }
+
+        val displayArea = currentDisplayArea()
+        val snapshots = windowList.map { w ->
+            val pkg = try {
+                w.root?.packageName?.toString()
+            } catch (_: Exception) {
+                null
+            }
+            val rect = Rect()
+            try {
+                w.getBoundsInScreen(rect)
+            } catch (_: Exception) {
+            }
+            WindowSnapshot(pkg, w.type, rect.width().toLong() * rect.height().toLong(), displayArea)
+        }
+
+        val wasShown = overlayManager.isShown
+        if (shield.onWindows(snapshots)) {
+            if (!wasShown) {
+                overlayManager.show(cachedRedirectConfig.theDoorPhrase)
+                startOverlayPoll()
+                // Navigate away (redirect/HOME): steals the foreground from the
+                // protected window and gives the user a sane landing screen.
+                triggerBlock()
+            }
+        } else {
+            overlayManager.hide()
+            stopOverlayPoll()
+        }
+    }
+
+    private fun isKeyguardShowing(): Boolean = try {
+        val km = getSystemService(KeyguardManager::class.java)
+        km != null && km.isKeyguardLocked
+    } catch (_: Exception) {
+        false
+    }
+
+    /**
+     * Content-based detection (phase 2): walks the node tree of visible Settings
+     * windows looking for protection keywords. Closes the event.text dependency —
+     * titles can arrive empty, but rendered content does not lie.
+     */
+    private fun scanWindowsForProtectedContent(windows: List<AccessibilityWindowInfo>): String? {
+        val cfg = protectionConfig.get()
+        val keywords = buildContentKeywords(cfg)
+        if (keywords.isEmpty()) return null
+        for (w in windows) {
+            val root = try {
+                w.root
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            val pkg = try {
+                root.packageName?.toString()
+            } catch (_: Exception) {
+                null
+            } ?: continue
+            if (pkg != PackageConstants.SETTINGS) continue
+            val content = collectNodeText(root)
+            if (content.isEmpty()) continue
+            val lower = content.lowercase()
+            if (keywords.any { lower.contains(it) }) {
+                return PackageConstants.SETTINGS
+            }
+        }
+        return null
+    }
+
+    private fun collectNodeText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < CONTENT_SCAN_MAX_NODES) {
+            val node = queue.removeFirst()
+            visited++
+            try {
+                node.text?.let { sb.append(it).append(' ') }
+                node.contentDescription?.let { sb.append(it).append(' ') }
+            } catch (_: Exception) {
+            }
+            for (i in 0 until node.childCount) {
+                try {
+                    node.getChild(i)?.let { queue.add(it) }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun buildSettingsKeywords(cfg: ProtectionConfig): List<String> = buildList {
+        if (cfg.blockAccessibilitySettings) {
+            addAll(BLOCKED_ACCESSIBILITY)
+            // The service's own detail screen is gated by the accessibility toggle too,
+            // not only by the uninstall toggle.
+            addAll(BLOCKED_THE_DOOR)
+        }
+        if (cfg.blockDeveloperOptions) addAll(BLOCKED_DEV_OPTIONS)
+        if (cfg.blockVpn) addAll(BLOCKED_VPN)
+        if (cfg.blockPrivateDns) addAll(BLOCKED_PRIVATE_DNS)
+        if (cfg.blockUninstallTheDoor) addAll(BLOCKED_THE_DOOR)
+        if (cfg.blockUninstallRethink) addAll(BLOCKED_RETHINK)
+        if (cfg.blockLanguageChanges) addAll(BLOCKED_LANGUAGE)
+        if (cfg.blockAppInfo) addAll(BLOCKED_ADMIN)
+        if (cfg.blockInstallUnknownApps) addAll(BLOCKED_UNKNOWN_INSTALL)
+    }
+
+    /**
+     * Keywords for the CONTENT scan. Deliberately restricted to high-specificity
+     * strings that identify the crown-jewel screens: generic terms like
+     * "accessibility" or "language" also match the Settings home screen (which
+     * renders them as menu items) and would lock the user out of the entire
+     * Settings app. Generic terms stay in the event-based branch, which matches
+     * window titles only.
+     */
+    private fun buildContentKeywords(cfg: ProtectionConfig): List<String> = buildList {
+        if (cfg.blockAccessibilitySettings) {
+            addAll(CONTENT_BLOCKED_ACCESSIBILITY)
+            addAll(BLOCKED_THE_DOOR)
+        }
+        if (cfg.blockUninstallTheDoor) addAll(BLOCKED_THE_DOOR)
+        if (cfg.blockDeveloperOptions) addAll(BLOCKED_DEV_OPTIONS)
+        if (cfg.blockInstallUnknownApps) addAll(BLOCKED_UNKNOWN_INSTALL)
+    }
+
+    private fun currentDisplayArea(): Long {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val wm = getSystemService(WindowManager::class.java)
+                val bounds = wm.currentWindowMetrics.bounds
+                bounds.width().toLong() * bounds.height().toLong()
+            } else {
+                val dm = resources.displayMetrics
+                dm.widthPixels.toLong() * dm.heightPixels.toLong()
+            }
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    private val overlayPollRunnable = object : Runnable {
+        override fun run() {
+            if (!overlayManager.isShown) return
+            assertProtectionOverlay(force = true)
+            if (overlayManager.isShown) {
+                handler.postDelayed(this, OVERLAY_POLL_MS)
+            }
+        }
+    }
+
+    private fun startOverlayPoll() {
+        handler.removeCallbacks(overlayPollRunnable)
+        handler.postDelayed(overlayPollRunnable, OVERLAY_POLL_MS)
+    }
+
+    private fun stopOverlayPoll() {
+        handler.removeCallbacks(overlayPollRunnable)
     }
 
     private fun isScheduleActive(packageName: String): Boolean {
@@ -300,9 +601,14 @@ class TheDoorAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED && event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED) return
 
         if (!setupComplete) return
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            assertProtectionOverlay()
+            return
+        }
 
         val packageName = event.packageName?.toString() ?: return
 
@@ -312,6 +618,10 @@ class TheDoorAccessibilityService : AccessibilityService() {
                 event.text.joinToString(" ")
             }\" contentDesc=\"${event.contentDescription}\""
         )
+
+        // Throttled containment evaluation: preventive floating-window detection and
+        // content-based keyword scan. Never suppresses the keyword branches below.
+        assertProtectionOverlay()
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             val contentDesc = event.contentDescription?.toString()?.lowercase() ?: ""
@@ -340,17 +650,7 @@ class TheDoorAccessibilityService : AccessibilityService() {
         if (packageName == PackageConstants.SETTINGS) {
             val cfg = protectionConfig.get()
             val eventText = event.text.joinToString(" ").lowercase()
-            val blockedKeywords = buildList {
-                if (cfg.blockAccessibilitySettings) addAll(BLOCKED_ACCESSIBILITY)
-                if (cfg.blockDeveloperOptions) addAll(BLOCKED_DEV_OPTIONS)
-                if (cfg.blockVpn) addAll(BLOCKED_VPN)
-                if (cfg.blockPrivateDns) addAll(BLOCKED_PRIVATE_DNS)
-                if (cfg.blockUninstallTheDoor) addAll(BLOCKED_THE_DOOR)
-                if (cfg.blockUninstallRethink) addAll(BLOCKED_RETHINK)
-                if (cfg.blockLanguageChanges) addAll(BLOCKED_LANGUAGE)
-                if (cfg.blockAppInfo) addAll(BLOCKED_ADMIN)
-                if (cfg.blockInstallUnknownApps) addAll(BLOCKED_UNKNOWN_INSTALL)
-            }
+            val blockedKeywords = buildSettingsKeywords(cfg)
             val isAppInfoScreen =
                 cfg.blockAppInfo && (className.contains("AppInfoDashboardActivity") || className.contains(
                     "InstalledAppDetailsActivity"
@@ -360,7 +660,7 @@ class TheDoorAccessibilityService : AccessibilityService() {
             if (blockedKeywords.any { eventText.contains(it) } || (cfg.blockAppInfo && className.contains(
                     "DeviceAdminSettingsActivity"
                 )) || isAppInfoScreen) {
-                triggerBlock()
+                triggerProtectionBlock(PackageConstants.SETTINGS)
                 return
             }
         }
@@ -369,7 +669,7 @@ class TheDoorAccessibilityService : AccessibilityService() {
             val cfg = protectionConfig.get()
             val eventText = event.text.joinToString(" ").lowercase()
             if (cfg.blockAutoBlocker && BLOCKED_AUTO_BLOCKER.any { eventText.contains(it) }) {
-                triggerBlock()
+                triggerProtectionBlock(PackageConstants.SAMSUNG_BIOMETRICS_SETTINGS)
                 return
             }
         }
@@ -380,7 +680,7 @@ class TheDoorAccessibilityService : AccessibilityService() {
                     it
                 ) || eventText.contains(it)
             }) {
-            triggerBlock()
+            triggerProtectionBlock(PackageConstants.SECURE_FOLDER)
             return
         }
 
@@ -424,15 +724,15 @@ class TheDoorAccessibilityService : AccessibilityService() {
             val eventText = event.text.joinToString(" ").lowercase()
             if (eventText.contains("uninstall") || eventText.contains("desinstalar")) {
                 if (cfg.blockUninstallTheDoor && eventText.contains("the door")) {
-                    triggerBlock()
+                    triggerProtectionBlock(packageName)
                     return
                 }
                 if (cfg.blockUninstallFirefox && eventText.contains("firefox")) {
-                    triggerBlock()
+                    triggerProtectionBlock(packageName)
                     return
                 }
                 if (cfg.blockUninstallRethink && eventText.contains("rethink")) {
-                    triggerBlock()
+                    triggerProtectionBlock(packageName)
                     return
                 }
             }
@@ -445,15 +745,15 @@ class TheDoorAccessibilityService : AccessibilityService() {
                     "settings"
                 ) || eventText.contains("extensões") || eventText.contains("configurações"))
             ) {
-                triggerBlock()
+                triggerProtectionBlock(PackageConstants.FIREFOX)
                 return
             }
             if (cfg.blockFirefoxUblockOrigin && eventText.contains("ublock origin")) {
-                triggerBlock()
+                triggerProtectionBlock(PackageConstants.FIREFOX)
                 return
             }
             if (cfg.blockFirefoxBlockNSFW && eventText.contains("blocknsfw")) {
-                triggerBlock()
+                triggerProtectionBlock(PackageConstants.FIREFOX)
                 return
             }
         }
@@ -548,7 +848,25 @@ class TheDoorAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        // onInterrupt only asks to stop current feedback; the enforcement loops must
+        // survive it (they were previously killed here and never rescheduled).
         handler.removeCallbacks(gradualReductionCheck)
         handler.removeCallbacks(limitCheckRunnable)
+        handler.postDelayed(gradualReductionCheck, 6 * 60 * 60 * 1000L)
+        handler.postDelayed(limitCheckRunnable, 5_000L)
+        overlayManager.hide()
+        stopOverlayPoll()
+    }
+
+    override fun onKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null && overlayManager.shouldConsumeKeys()) {
+            return when (event.keyCode) {
+                KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE ->
+                    super.onKeyEvent(event)
+
+                else -> true
+            }
+        }
+        return super.onKeyEvent(event)
     }
 }
