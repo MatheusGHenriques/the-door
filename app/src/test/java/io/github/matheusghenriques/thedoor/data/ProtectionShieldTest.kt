@@ -67,6 +67,39 @@ class ProtectionShieldTest {
         assertFalse(shield.isIncidentActive)
     }
 
+    // ---------------------------------------------------------------- floating gate
+
+    @Test
+    fun `floating settings does not start incident when detection disabled`() {
+        val visible = shield.onWindows(
+            listOf(window(PackageConstants.SETTINGS, area = 300_000)),
+            floatingDetectionEnabled = false
+        )
+        assertFalse(visible)
+        assertFalse(shield.isIncidentActive)
+    }
+
+    @Test
+    fun `floating settings starts incident when detection enabled`() {
+        val visible = shield.onWindows(
+            listOf(window(PackageConstants.SETTINGS, area = 300_000)),
+            floatingDetectionEnabled = true
+        )
+        assertTrue(visible)
+        assertTrue(shield.isIncidentActive)
+    }
+
+    @Test
+    fun `floating settings still holds overlay during active incident regardless of gate`() {
+        shield.startIncident(PackageConstants.FIREFOX)
+        now = 60_000
+        val visible = shield.onWindows(
+            listOf(window(PackageConstants.SETTINGS, area = 300_000)),
+            floatingDetectionEnabled = false
+        )
+        assertTrue(visible)
+    }
+
     // ---------------------------------------------------------------- retention
 
     @Test

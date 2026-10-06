@@ -9,8 +9,9 @@ import android.view.accessibility.AccessibilityWindowInfo
  * Main-thread confined; no internal synchronization.
  *
  * Incident lifecycle:
- * - An incident starts on a protection trigger ([startIncident]) or preventively when a
- *   floating (popup/split-screen) Settings window is detected ([onWindows]).
+ * - An incident starts on a protection trigger ([startIncident]) or preventively
+ *   when a floating (popup/split-screen) Settings window is detected ([onWindows],
+ *   gated by the caller's floating-detection flag).
  * - While any window of an active package remains visible, the overlay stays up.
  * - The overlay is only released after [REMOVAL_DEBOUNCE_MS] of CONTINUOUS absence of all
  *   active-package windows. Reappearance resets the timer. This delay only extends
@@ -66,13 +67,25 @@ class ProtectionShield(
     /**
      * Evaluates the latest window snapshot and returns whether the containment
      * overlay should be visible right now.
+     *
+     * [floatingDetectionEnabled] gates the PREVENTIVE start of an incident on a
+     * floating Settings window (the service passes the accessibility-protection
+     * toggle — if the user did not enable that protection, opening Settings in
+     * popup/split-screen must not contain anything). Once an incident is active,
+     * a floating Settings window counts as presence regardless of the gate:
+     * retention rules never loosen.
      */
-    fun onWindows(snapshots: List<WindowSnapshot>): Boolean {
+    fun onWindows(
+        snapshots: List<WindowSnapshot>,
+        floatingDetectionEnabled: Boolean = true
+    ): Boolean {
         val floatingSettings = snapshots.any { it.isFloatingSettings() }
 
         if (!isIncidentActive) {
-            if (floatingSettings) startIncident(PackageConstants.SETTINGS)
-            return floatingSettings
+            if (floatingDetectionEnabled && floatingSettings) {
+                startIncident(PackageConstants.SETTINGS)
+            }
+            return floatingDetectionEnabled && floatingSettings
         }
 
         val present = floatingSettings || snapshots.any { it.isRelevantTo(activePackages, selfPackage) }
